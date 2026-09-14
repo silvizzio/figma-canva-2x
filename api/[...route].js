@@ -46,9 +46,7 @@ export default async function handler(request, response) {
     return;
   }
 
-  const route = Array.isArray(request.query.route)
-    ? request.query.route.join("/")
-    : String(request.query.route || "");
+  const route = routeFrom(request);
 
   try {
     switch (route) {
@@ -423,6 +421,24 @@ async function redis(command) {
 /* ----------------------------------------------------------------------------
  * Helpers
  * ------------------------------------------------------------------------- */
+
+/**
+ * Reads the route from the URL path, for example /api/upload-frame gives upload-frame.
+ * The dynamic query parameter is used only as a fallback.
+ */
+function routeFrom(request) {
+  const rawPath = String(request.url || "/").split("?")[0].replace(/^\/+/, "/");
+  const path = new URL(rawPath, "http://relay.local").pathname;
+  const segments = path.replace(/^\/+/, "").replace(/\/+$/, "").split("/");
+
+  if (segments[0] === "api") segments.shift();
+
+  const fromPath = segments.filter(Boolean).join("/");
+  if (fromPath) return fromPath;
+
+  const fromQuery = request.query && request.query.route;
+  return Array.isArray(fromQuery) ? fromQuery.join("/") : String(fromQuery || "");
+}
 
 function requireEnv(name) {
   const value = process.env[name];
