@@ -4,11 +4,14 @@
   "api": "1.0.0",
   "main": "code.js",
   "ui": "ui.html",
-  "editorType": ["figma"],
+  "editorType": [
+    "figma"
+  ],
   "documentAccess": "dynamic-page",
-  "permissions": ["fileKey"],
   "networkAccess": {
-    "allowedDomains": ["https://figma-canva-2x.vercel.app"],
+    "allowedDomains": [
+      "https://figma-canva-2x.vercel.app"
+    ],
     "reasoning": "Sends frame ids and names to a private relay, which uploads the 2x render to the user's Canva library."
   }
 }
