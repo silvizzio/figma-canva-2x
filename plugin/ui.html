@@ -1,0 +1,488 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<style>
+  :root { --gap: 8px; --radius: 4px; }
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    font-family: Inter, "Helvetica Neue", sans-serif;
+    font-size: 11px;
+    line-height: 16px;
+    color: var(--figma-color-text, #1b1b1b);
+    background: var(--figma-color-bg, #ffffff);
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+  }
+
+  header, footer { padding: 12px; flex: none; }
+  header { border-bottom: 1px solid var(--figma-color-border, #e6e6e6); }
+  footer { border-top: 1px solid var(--figma-color-border, #e6e6e6); }
+  main { flex: 1; overflow-y: auto; padding: 12px; }
+
+  h2 { font-size: 11px; font-weight: 600; margin: 0 0 var(--gap); }
+  label { display: block; margin-bottom: 4px; color: var(--figma-color-text-secondary, #666); }
+
+  input[type="text"], input[type="password"], input[type="number"] {
+    width: 100%;
+    height: 28px;
+    padding: 0 8px;
+    margin-bottom: var(--gap);
+    border: 1px solid var(--figma-color-border, #e6e6e6);
+    border-radius: var(--radius);
+    background: var(--figma-color-bg, #fff);
+    color: inherit;
+    font: inherit;
+  }
+
+  input:focus {
+    outline: 1px solid var(--figma-color-border-selected, #0d99ff);
+    border-color: var(--figma-color-border-selected, #0d99ff);
+  }
+
+  .row { display: flex; gap: var(--gap); align-items: flex-end; }
+  .row > * { flex: 1; }
+
+  .check { display: flex; align-items: center; gap: 6px; margin-bottom: var(--gap); }
+  .check input { width: auto; margin: 0; }
+  .check label { margin: 0; color: inherit; }
+
+  button {
+    height: 28px;
+    padding: 0 12px;
+    border-radius: var(--radius);
+    border: 1px solid transparent;
+    font: inherit;
+    cursor: pointer;
+  }
+
+  button.primary {
+    background: var(--figma-color-bg-brand, #0d99ff);
+    color: var(--figma-color-text-onbrand, #fff);
+    width: 100%;
+  }
+
+  button.secondary {
+    background: transparent;
+    border-color: var(--figma-color-border, #e6e6e6);
+    color: inherit;
+  }
+
+  button:disabled { opacity: 0.4; cursor: default; }
+
+  details { margin-bottom: 12px; }
+  summary { cursor: pointer; font-weight: 600; margin-bottom: var(--gap); }
+
+  .item {
+    display: flex;
+    justify-content: space-between;
+    gap: var(--gap);
+    padding: 6px 0;
+    border-bottom: 1px solid var(--figma-color-border, #f0f0f0);
+  }
+
+  .item .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .item .meta { color: var(--figma-color-text-secondary, #666); flex: none; }
+  .item.skip .name { text-decoration: line-through; opacity: 0.6; }
+  .item .state { flex: none; font-variant-numeric: tabular-nums; }
+  .state.ok { color: var(--figma-color-text-success, #14ae5c); }
+  .state.fail { color: var(--figma-color-text-danger, #f24822); }
+
+  .muted { color: var(--figma-color-text-secondary, #666); }
+  .status { margin-bottom: var(--gap); min-height: 16px; }
+  .error { color: var(--figma-color-text-danger, #f24822); }
+</style>
+</head>
+<body>
+
+<header>
+  <details id="settings-panel">
+    <summary>Relay settings</summary>
+
+    <label for="relayUrl">Relay URL</label>
+    <input id="relayUrl" type="text" placeholder="https://figma-canva-2x.vercel.app" />
+
+    <label for="pluginKey">Plugin key</label>
+    <input id="pluginKey" type="password" placeholder="Shared secret set on the project" />
+
+    <label for="fileKey">Figma file key</label>
+    <input id="fileKey" type="text" placeholder="From the file URL, between /design/ and the file name" />
+
+    <div class="row">
+      <div>
+        <label for="startNumber">Start number</label>
+        <input id="startNumber" type="number" min="0" value="1" />
+      </div>
+      <div>
+        <label for="padWidth">Digits</label>
+        <input id="padWidth" type="number" min="1" max="4" value="2" />
+      </div>
+    </div>
+
+    <div class="check">
+      <input id="sizeCheck" type="checkbox" checked />
+      <label for="sizeCheck">Upload 1920x1080 frames only</label>
+    </div>
+
+    <div class="row">
+      <button class="secondary" id="save">Save settings</button>
+      <button class="secondary" id="test">Test connection</button>
+    </div>
+  </details>
+
+  <div class="status muted" id="status">Loading frames.</div>
+</header>
+
+<main>
+  <h2 id="list-title">Frames</h2>
+  <div id="list"></div>
+</main>
+
+<footer>
+  <button class="primary" id="run" disabled>Export and upload</button>
+</footer>
+
+<script>
+  // Canva allows 30 upload jobs per minute per user. Stay under that.
+  var MAX_UPLOADS_PER_MINUTE = 25;
+  var MAX_ATTEMPTS = 3;
+  var JOB_POLL_ATTEMPTS = 20;
+  var JOB_POLL_INTERVAL = 2000;
+  var MAX_FALLBACK_BYTES = 3000000;
+
+  var state = { settings: null, items: [], running: false, uploadTimes: [] };
+  var pendingExport = {};
+
+  var elements = {
+    relayUrl: document.getElementById("relayUrl"),
+    pluginKey: document.getElementById("pluginKey"),
+    fileKey: document.getElementById("fileKey"),
+    startNumber: document.getElementById("startNumber"),
+    padWidth: document.getElementById("padWidth"),
+    sizeCheck: document.getElementById("sizeCheck"),
+    save: document.getElementById("save"),
+    test: document.getElementById("test"),
+    run: document.getElementById("run"),
+    list: document.getElementById("list"),
+    listTitle: document.getElementById("list-title"),
+    status: document.getElementById("status"),
+    panel: document.getElementById("settings-panel"),
+  };
+
+  function post(message) {
+    parent.postMessage({ pluginMessage: message }, "*");
+  }
+
+  function setStatus(text, isError) {
+    elements.status.textContent = text;
+    elements.status.className = "status " + (isError ? "error" : "muted");
+  }
+
+  function currentSettings() {
+    return {
+      relayUrl: elements.relayUrl.value.trim().replace(/\/+$/, ""),
+      pluginKey: elements.pluginKey.value.trim(),
+      fileKey: elements.fileKey.value.trim(),
+      startNumber: Number(elements.startNumber.value) || 1,
+      padWidth: Number(elements.padWidth.value) || 2,
+      separator: " ",
+      sizeCheck: elements.sizeCheck.checked,
+    };
+  }
+
+  function applySettings(settings, detectedFileKey) {
+    state.settings = settings;
+    elements.relayUrl.value = settings.relayUrl || "";
+    elements.pluginKey.value = settings.pluginKey || "";
+    elements.fileKey.value = settings.fileKey || detectedFileKey || "";
+    elements.startNumber.value = settings.startNumber;
+    elements.padWidth.value = settings.padWidth;
+    elements.sizeCheck.checked = Boolean(settings.sizeCheck);
+
+    if (!settings.relayUrl || !settings.pluginKey || !elements.fileKey.value) {
+      elements.panel.open = true;
+    }
+  }
+
+  function renderList(payload) {
+    state.items = payload.items;
+    elements.listTitle.textContent = payload.usingSelection
+      ? "Selected frames (" + payload.items.length + ")"
+      : "Top level frames on " + payload.pageName + " (" + payload.items.length + ")";
+
+    elements.list.innerHTML = "";
+
+    payload.items.forEach(function (item) {
+      var row = document.createElement("div");
+      row.className = "item" + (item.skipped ? " skip" : "");
+      row.id = "item-" + item.id;
+
+      var name = document.createElement("div");
+      name.className = "name";
+      name.textContent = item.skipped ? item.nodeName : item.assetName;
+      name.title = item.nodeName;
+
+      var meta = document.createElement("div");
+      meta.className = "meta";
+      meta.textContent = item.skipped
+        ? item.width + "x" + item.height + " skipped"
+        : item.outputWidth + "x" + item.outputHeight;
+
+      var result = document.createElement("div");
+      result.className = "state";
+
+      row.appendChild(name);
+      row.appendChild(meta);
+      row.appendChild(result);
+      elements.list.appendChild(row);
+    });
+
+    var uploadable = payload.items.filter(function (item) { return !item.skipped; });
+    elements.run.disabled = state.running || uploadable.length === 0;
+
+    if (!state.running) {
+      setStatus(
+        uploadable.length === 0
+          ? "No frame matches the rule. Select frames, or switch off the size check."
+          : uploadable.length + " frames ready. Output is 2x PNG."
+      );
+    }
+  }
+
+  function markResult(id, text, className) {
+    var row = document.getElementById("item-" + id);
+    if (!row) return;
+    var cell = row.querySelector(".state");
+    cell.textContent = text;
+    cell.className = "state " + (className || "");
+  }
+
+  function wait(ms) {
+    return new Promise(function (resolve) { setTimeout(resolve, ms); });
+  }
+
+  function requestExport(id) {
+    return new Promise(function (resolve, reject) {
+      pendingExport[id] = { resolve: resolve, reject: reject };
+      post({ type: "export-node", id: id });
+    });
+  }
+
+  function toBase64(bytes) {
+    var binary = "";
+    var chunk = 0x8000;
+    for (var i = 0; i < bytes.length; i += chunk) {
+      binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+    }
+    return btoa(binary);
+  }
+
+  async function call(path, options) {
+    var settings = state.settings;
+    var response = await fetch(settings.relayUrl + path, Object.assign({
+      headers: Object.assign({ "x-plugin-key": settings.pluginKey }, (options && options.headers) || {}),
+    }, options || {}));
+
+    var data = await response.json().catch(function () { return {}; });
+
+    if (!response.ok) {
+      var error = new Error(data.error || "Relay returned " + response.status);
+      error.status = response.status;
+      error.code = data.code;
+      throw error;
+    }
+    return data;
+  }
+
+  async function throttle() {
+    var now = Date.now();
+    state.uploadTimes = state.uploadTimes.filter(function (time) { return now - time < 60000; });
+    if (state.uploadTimes.length >= MAX_UPLOADS_PER_MINUTE) {
+      var waitMs = 60000 - (now - state.uploadTimes[0]) + 500;
+      setStatus("Waiting " + Math.ceil(waitMs / 1000) + "s for the Canva rate limit.");
+      await wait(waitMs);
+    }
+    state.uploadTimes.push(Date.now());
+  }
+
+  async function waitForJob(job) {
+    var current = job;
+
+    for (var attempt = 0; attempt < JOB_POLL_ATTEMPTS; attempt += 1) {
+      if (current.status !== "in_progress") return current;
+      await wait(JOB_POLL_INTERVAL);
+      current = await call("/api/job?id=" + encodeURIComponent(current.jobId) + "&kind=" + current.kind, { method: "GET" });
+    }
+    throw new Error("The Canva job did not finish in time.");
+  }
+
+  async function uploadByRender(item) {
+    var job = await call("/api/upload-frame", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        fileKey: state.settings.fileKey,
+        nodeId: item.id,
+        name: item.assetName,
+      }),
+    });
+    return waitForJob(job);
+  }
+
+  async function uploadByBytes(item) {
+    var bytes = await requestExport(item.id);
+    if (bytes.length > MAX_FALLBACK_BYTES) {
+      throw new Error("The PNG is " + (bytes.length / 1048576).toFixed(1) + " MB, over the relay fallback limit.");
+    }
+
+    var job = await call("/api/upload-bytes", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: item.assetName, dataBase64: toBase64(bytes) }),
+    });
+    return waitForJob(job);
+  }
+
+  async function uploadItem(item) {
+    var lastError = null;
+
+    for (var attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
+      try {
+        await throttle();
+        return await uploadByRender(item);
+      } catch (error) {
+        lastError = error;
+
+        if (error.code === "figma_render_failed") {
+          markResult(item.id, "retry", "");
+          await throttle();
+          return await uploadByBytes(item);
+        }
+
+        var retryable = !error.status || error.status === 429 || error.status >= 500;
+        if (!retryable || attempt === MAX_ATTEMPTS) break;
+        await wait(attempt * 5000);
+      }
+    }
+    throw lastError;
+  }
+
+  async function run() {
+    var settings = currentSettings();
+
+    if (!settings.relayUrl || !settings.pluginKey || !settings.fileKey) {
+      elements.panel.open = true;
+      setStatus("Add the relay URL, the plugin key, and the file key first.", true);
+      return;
+    }
+
+    post({ type: "save-settings", settings: settings });
+    state.settings = settings;
+
+    var queue = state.items.filter(function (item) { return !item.skipped; });
+    state.running = true;
+    elements.run.disabled = true;
+
+    var done = 0;
+    var failed = 0;
+
+    for (var index = 0; index < queue.length; index += 1) {
+      var item = queue[index];
+      setStatus("Uploading " + (index + 1) + " of " + queue.length + ": " + item.assetName);
+      markResult(item.id, "...", "");
+
+      try {
+        var result = await uploadItem(item);
+        if (result.status !== "success") {
+          throw new Error(result.error ? result.error.message : "Canva reported " + result.status);
+        }
+        markResult(item.id, result.width && result.height ? result.width + "x" + result.height : "uploaded", "ok");
+        done += 1;
+      } catch (error) {
+        markResult(item.id, "failed", "fail");
+        console.error(item.assetName, error);
+        setStatus(item.assetName + ": " + error.message, true);
+        failed += 1;
+      }
+    }
+
+    state.running = false;
+    elements.run.disabled = false;
+
+    var summary = done + " uploaded to Canva" + (failed ? ", " + failed + " failed" : "") + ".";
+    if (!failed) setStatus(summary);
+    post({ type: "run-finished", summary: summary });
+  }
+
+  elements.save.addEventListener("click", function () {
+    var settings = currentSettings();
+    post({ type: "save-settings", settings: settings });
+    state.settings = settings;
+    setStatus("Settings saved.");
+  });
+
+  elements.test.addEventListener("click", async function () {
+    var settings = currentSettings();
+    if (!settings.relayUrl || !settings.pluginKey) {
+      setStatus("Add the relay URL and the plugin key first.", true);
+      return;
+    }
+    state.settings = settings;
+    setStatus("Checking the relay.");
+
+    try {
+      var data = await call("/api/status", { method: "GET" });
+      if (!data.connected) {
+        setStatus("Relay works, but Canva is not authorised. Open /api/connect?key=... in a browser.", true);
+      } else if (!data.figmaTokenSet) {
+        setStatus("Canva is connected, but FIGMA_TOKEN is not set on the project.", true);
+      } else {
+        setStatus("Ready. Canva token expires in " + Math.round(data.expiresInSeconds / 60) + " min.");
+      }
+    } catch (error) {
+      setStatus("Relay check failed: " + error.message, true);
+    }
+  });
+
+  [elements.startNumber, elements.padWidth, elements.sizeCheck, elements.fileKey].forEach(function (input) {
+    input.addEventListener("change", function () {
+      var settings = currentSettings();
+      post({ type: "save-settings", settings: settings });
+      state.settings = settings;
+    });
+  });
+
+  elements.run.addEventListener("click", run);
+
+  window.onmessage = function (event) {
+    var message = event.data.pluginMessage;
+    if (!message) return;
+
+    if (message.type === "settings") {
+      applySettings(message.settings, message.detectedFileKey);
+    } else if (message.type === "list") {
+      renderList(message);
+    } else if (message.type === "export-result") {
+      var waiting = pendingExport[message.id];
+      if (waiting) {
+        delete pendingExport[message.id];
+        waiting.resolve(message.bytes);
+      }
+    } else if (message.type === "export-error") {
+      var failedExport = pendingExport[message.id];
+      if (failedExport) {
+        delete pendingExport[message.id];
+        failedExport.reject(new Error(message.message));
+      }
+    } else if (message.type === "plugin-error") {
+      setStatus(message.message, true);
+    }
+  };
+
+  post({ type: "ui-ready" });
+</script>
+</body>
+</html>

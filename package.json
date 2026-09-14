@@ -1,0 +1,10 @@
+{
+  "name": "figma-canva-2x",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Relay between a Figma plugin and the Canva Connect API, running on Vercel",
+  "engines": {
+    "node": ">=20"
+  }
+}
