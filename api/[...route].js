@@ -64,6 +64,10 @@ export default async function handler(request, response) {
         return await handleUploadBytes(request, response);
       case "job":
         return await handleJob(request, response);
+      case "diagnose":
+        return await handleDiagnose(request, response);
+      case "oauth-error":
+        return handleOauthError(request, response);
       default:
         return response.status(404).json({ error: `Unknown route: ${route}` });
     }
@@ -396,6 +400,156 @@ function describeJob(job, jobId, kind) {
 }
 
 /* ----------------------------------------------------------------------------
+ * Diagnostics
+ * ------------------------------------------------------------------------- */
+
+/**
+ * One request that reports the state of every moving part. Add ?fileKey=... to
+ * also test that the Figma token can render a node from that file.
+ */
+async function handleDiagnose(request, response) {
+  requireKey(request.headers["x-plugin-key"] || request.query.key);
+
+  const report = {
+    checkedAt: new Date().toISOString(),
+    origin: originOf(request),
+    redirectUri: `${originOf(request)}/api/oauth-callback`,
+    env: {},
+    redis: {},
+    canva: {},
+    figma: {},
+    verdict: [],
+  };
+
+  // Environment variables.
+  const clientId = process.env.CANVA_CLIENT_ID || "";
+  report.env.CANVA_CLIENT_ID = clientId
+    ? { set: true, value: clientId, looksValid: /^OC-/.test(clientId) }
+    : { set: false };
+  report.env.CANVA_CLIENT_SECRET = { set: Boolean(process.env.CANVA_CLIENT_SECRET) };
+  report.env.PLUGIN_KEY = { set: Boolean(process.env.PLUGIN_KEY) };
+  report.env.FIGMA_TOKEN = { set: Boolean(process.env.FIGMA_TOKEN) };
+  report.env.RELAY_ORIGIN = process.env.RELAY_ORIGIN
+    ? { set: true, value: process.env.RELAY_ORIGIN }
+    : { set: false, note: "Falls back to the request host, which differs on preview URLs." };
+  report.env.redisVars = {
+    set: Boolean(
+      (process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL) &&
+        (process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN)
+    ),
+  };
+
+  if (!report.env.CANVA_CLIENT_ID.set) {
+    report.verdict.push("CANVA_CLIENT_ID is missing.");
+  } else if (!report.env.CANVA_CLIENT_ID.looksValid) {
+    report.verdict.push("CANVA_CLIENT_ID does not start with OC-, so it is probably the wrong value.");
+  }
+  if (!report.env.CANVA_CLIENT_SECRET.set) report.verdict.push("CANVA_CLIENT_SECRET is missing.");
+  if (!report.env.FIGMA_TOKEN.set) report.verdict.push("FIGMA_TOKEN is missing.");
+
+  // Redis.
+  try {
+    const pong = await redis(["PING"]);
+    report.redis = { reachable: true, reply: pong };
+  } catch (error) {
+    report.redis = { reachable: false, error: error.message };
+    report.verdict.push("Redis is unreachable, so tokens cannot be stored.");
+  }
+
+  // Stored Canva token.
+  if (report.redis.reachable) {
+    try {
+      const record = await readToken();
+      if (!record) {
+        report.canva = { connected: false };
+        report.verdict.push("Canva is not authorised yet. Open /api/connect?key=... in a browser.");
+      } else {
+        const secondsLeft = Math.round((record.expiresAt - Date.now()) / 1000);
+        report.canva = {
+          connected: true,
+          expiresInSeconds: secondsLeft,
+          expired: secondsLeft <= 0,
+          refreshTokenStored: Boolean(record.refreshToken),
+        };
+      }
+    } catch (error) {
+      report.canva = { connected: false, error: error.message };
+    }
+  }
+
+  // Figma token.
+  if (report.env.FIGMA_TOKEN.set) {
+    try {
+      const result = await fetch(`${FIGMA_API}/me`, {
+        headers: { "X-Figma-Token": process.env.FIGMA_TOKEN },
+      });
+      const data = await result.json().catch(() => ({}));
+      report.figma.tokenValid = result.ok;
+      report.figma.account = result.ok ? data.email || data.handle || "unknown" : undefined;
+      if (!result.ok) {
+        report.figma.error = `${result.status} ${data.err || data.message || ""}`.trim();
+        report.verdict.push("The Figma token was rejected. Check that it has File content read access.");
+      }
+    } catch (error) {
+      report.figma = { tokenValid: false, error: error.message };
+    }
+
+    // Optional render test.
+    const fileKey = request.query.fileKey ? String(request.query.fileKey) : "";
+    if (fileKey && report.figma.tokenValid) {
+      try {
+        const result = await fetch(`${FIGMA_API}/files/${encodeURIComponent(fileKey)}?depth=1`, {
+          headers: { "X-Figma-Token": process.env.FIGMA_TOKEN },
+        });
+        const data = await result.json().catch(() => ({}));
+        report.figma.fileAccess = result.ok
+          ? { ok: true, name: data.name, lastModified: data.lastModified }
+          : { ok: false, error: `${result.status} ${data.err || data.message || ""}`.trim() };
+        if (!result.ok) {
+          report.verdict.push("The Figma token cannot open that file key.");
+        }
+      } catch (error) {
+        report.figma.fileAccess = { ok: false, error: error.message };
+      }
+    }
+  }
+
+  if (report.verdict.length === 0) {
+    report.verdict.push("Everything the relay can check is in order.");
+  }
+
+  return response.status(200).json(report);
+}
+
+/**
+ * Canva sends OAuth failures to the site root with the reason in the query string,
+ * where a bare 404 would hide it. A rewrite in vercel.json points / at this route.
+ */
+function handleOauthError(request, response) {
+  const { error, error_description: description } = request.query;
+
+  if (!error && !description) {
+    return sendHtml(
+      response,
+      200,
+      "<h1>figma-canva-2x relay</h1><p>The relay is running. Start at /api/connect?key=...</p>"
+    );
+  }
+
+  return sendHtml(
+    response,
+    400,
+    `<h1>Canva refused the authorisation</h1>
+<p><strong>${escapeHtml(String(error || "error"))}</strong></p>
+<p>${escapeHtml(String(description || ""))}</p>
+<hr>
+<p>Most common cause: the redirect URL stored in the Canva integration does not match
+<code>${escapeHtml(originOf(request))}/api/oauth-callback</code> exactly. Fix URL 1 under
+Authorized redirects, then open /api/connect again.</p>`
+  );
+}
+
+/* ----------------------------------------------------------------------------
  * Storage (Upstash Redis over REST)
  * ------------------------------------------------------------------------- */
 
@@ -427,8 +581,7 @@ async function redis(command) {
  * The dynamic query parameter is used only as a fallback.
  */
 function routeFrom(request) {
-  const rawPath = String(request.url || "/").split("?")[0].replace(/^\/+/, "/");
-  const path = new URL(rawPath, "http://relay.local").pathname;
+  const path = new URL(request.url, "http://relay.local").pathname;
   const segments = path.replace(/^\/+/, "").replace(/\/+$/, "").split("/");
 
   if (segments[0] === "api") segments.shift();
